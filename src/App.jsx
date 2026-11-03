@@ -3,14 +3,17 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   BookOpen, LayoutDashboard, Plus, Search, Clock3,
   CalendarDays, Trash2, Pencil, CheckCircle2,
-  TrendingUp, X, GraduationCap
+  TrendingUp, X, GraduationCap, LogOut
 } from 'lucide-react'
+import { supabase } from './supabase'
 
-const initialSessions = [
-  { id: 1, subject: 'React Fundamentals', date: '2026-11-03', duration: 60, status: 'Completed' },
-  { id: 2, subject: 'SQL Practice', date: '2026-11-04', duration: 45, status: 'Planned' },
-  { id: 3, subject: 'JavaScript Review', date: '2026-11-05', duration: 90, status: 'Planned' }
-]
+import {
+  getSessions,
+  addSession,
+  updateSession,
+  deleteSession as removeSession,
+  changeSessionStatus
+} from './sessionService'
 
 const emptyForm = {
   subject: '',
@@ -19,16 +22,21 @@ const emptyForm = {
   status: 'Planned'
 }
 
-function App() {
-  const [sessions, setSessions] = useState(() => {
-    try {
-      const saved = localStorage.getItem('studyflow-sessions')
-      return saved ? JSON.parse(saved) : initialSessions
-    } catch {
-      return initialSessions
-    }
-  })
+function toSession(row) {
+  return {
+    id: row.id,
+    subject: row.subject,
+    date: row.session_date,
+    duration: row.duration,
+    status: row.status
+  }
+}
 
+function App() {
+  const [sessions, setSessions] = useState([])
+  const [loadingSessions, setLoadingSessions] = useState(true)
+  const [dbError, setDbError] = useState('')
+  const [saving, setSaving] = useState(false)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('All')
   const [showModal, setShowModal] = useState(false)
@@ -37,8 +45,25 @@ function App() {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    localStorage.setItem('studyflow-sessions', JSON.stringify(sessions))
-  }, [sessions])
+    let active = true
+
+    async function loadSessions() {
+      try {
+        const data = await getSessions()
+        if (active) {
+          setSessions(data.map(toSession))
+          setDbError('')
+        }
+      } catch (err) {
+        if (active) setDbError(err.message)
+      } finally {
+        if (active) setLoadingSessions(false)
+      }
+    }
+
+    loadSessions()
+    return () => { active = false }
+  }, [])
 
   const stats = useMemo(() => {
     const completed = sessions.filter(s => s.status === 'Completed')
@@ -78,52 +103,74 @@ function App() {
     setShowModal(true)
   }
 
-  function saveSession(event) {
+  async function saveSession(event) {
     event.preventDefault()
+    if (saving) return
+    setError('')
 
+    const duration = Number(form.duration)
     if (!form.subject.trim()) {
       setError('Please enter a subject.')
       return
     }
-
-    if (!form.date || Number(form.duration) <= 0) {
-      setError('Please enter a valid date and duration.')
+    if (!form.date || !Number.isInteger(duration) || duration < 1 || duration > 1440) {
+      setError('Please enter a valid date and duration (1–1440 minutes).')
       return
     }
 
     const sessionData = {
-      ...form,
       subject: form.subject.trim(),
-      duration: Number(form.duration)
+      date: form.date,
+      duration,
+      status: form.status
     }
 
-    if (editingId !== null) {
-      setSessions(previous =>
-        previous.map(s => s.id === editingId ? { ...s, ...sessionData } : s)
+    setSaving(true)
+    try {
+      const result = editingId !== null
+        ? await updateSession(editingId, sessionData)
+        : await addSession(sessionData)
+      const updated = toSession(result)
+      setSessions(previous => editingId !== null
+        ? previous.map(s => s.id === editingId ? updated : s)
+        : [updated, ...previous]
       )
-    } else {
-      setSessions(previous => [
-        { ...sessionData, id: crypto.randomUUID() },
-        ...previous
-      ])
+      setDbError('')
+      setShowModal(false)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
     }
-
-    setShowModal(false)
   }
 
-  function deleteSession(id) {
-    if (window.confirm('Are you sure you want to delete this session?')) {
+  async function deleteSession(id) {
+    if (!window.confirm('Are you sure you want to delete this session?')) return
+    try {
+      await removeSession(id)
       setSessions(previous => previous.filter(s => s.id !== id))
+      setDbError('')
+    } catch (err) {
+      setDbError(err.message)
     }
   }
 
-  function toggleStatus(id) {
-    setSessions(previous =>
-      previous.map(s => s.id === id
-        ? { ...s, status: s.status === 'Completed' ? 'Planned' : 'Completed' }
-        : s
-      )
-    )
+  async function toggleStatus(id) {
+    const current = sessions.find(s => s.id === id)
+    if (!current) return
+    const newStatus = current.status === 'Completed' ? 'Planned' : 'Completed'
+    try {
+      const updated = await changeSessionStatus(id, newStatus)
+      setSessions(previous => previous.map(s => s.id === id ? toSession(updated) : s))
+      setDbError('')
+    } catch (err) {
+      setDbError(err.message)
+    }
+  }
+
+  async function handleLogout() {
+    const { error } = await supabase.auth.signOut()
+    if (error) setDbError(error.message)
   }
 
   const cards = [
@@ -149,7 +196,15 @@ function App() {
             Dashboard
           </div>
 
-          <div className="mt-auto rounded-2xl bg-slate-800 p-4">
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="mt-auto mb-4 flex items-center gap-3 rounded-xl px-4 py-3 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+          >
+            <LogOut size={20} />
+            Logout
+          </button>
+          <div className="rounded-2xl bg-slate-800 p-4">
             <p className="font-semibold">Keep learning!</p>
             <p className="mt-2 text-sm text-slate-400">
               Small steps lead to big progress.
@@ -158,6 +213,12 @@ function App() {
         </aside>
 
         <main className="mx-auto w-full max-w-7xl flex-1 p-5 md:p-10">
+          {loadingSessions && (
+            <p role="status" className="mb-4 text-sm text-violet-600">Loading your sessions...</p>
+          )}
+          {dbError && (
+            <p role="alert" className="mb-4 rounded-xl bg-red-50 p-4 text-sm text-red-700">{dbError}</p>
+          )}
           <header className="mb-9 flex flex-wrap items-center justify-between gap-4">
             <div>
               <p className="text-sm font-medium text-violet-600">
@@ -177,6 +238,14 @@ function App() {
             >
               <Plus size={19} />
               New Session
+            </button>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-600 md:hidden"
+            >
+              <LogOut size={18} />
+              Logout
             </button>
           </header>
 
@@ -247,7 +316,7 @@ function App() {
               </div>
             </div>
 
-            {filteredSessions.length === 0 ? (
+            {!loadingSessions && filteredSessions.length === 0 ? (
               <div className="px-6 py-16 text-center">
                 <BookOpen size={40} className="mx-auto text-slate-300" />
                 <h3 className="mt-4 font-semibold">No sessions found</h3>
@@ -412,9 +481,10 @@ function App() {
 
               <button
                 type="submit"
-                className="w-full rounded-xl bg-violet-600 py-3 font-semibold text-white hover:bg-violet-700"
+                disabled={saving}
+                className="w-full rounded-xl bg-violet-600 py-3 font-semibold text-white hover:bg-violet-700 disabled:opacity-50"
               >
-                {editingId !== null ? 'Save Changes' : 'Create Session'}
+                {saving ? 'Saving...' : editingId !== null ? 'Save Changes' : 'Create Session'}
               </button>
             </form>
           </div>
